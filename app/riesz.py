@@ -10,11 +10,15 @@ def _pyr_down(img):
 def _pyr_up(img, dst_size):
     up = cv2.pyrUp(img)
     if up.shape[:2] != dst_size:
+        # cv2.resize pričakuje (width, height) = (cols, rows)
         up = cv2.resize(up, (dst_size[1], dst_size[0]), interpolation=cv2.INTER_LINEAR)
     return up
 
 def _build_laplacian_pyramid(img: np.ndarray, levels: int):
-    """Return (lap_levels:list[H×W], residual: H/2^L × W/2^L)."""
+    """
+    Vrne (seznam Laplace bandov [lvl0..lvlL-1], residual na dnu).
+    lvl0 je najvišja ločljivost (najfinejši band).
+    """
     g = [img]
     for _ in range(levels):
         g.append(_pyr_down(g[-1]))
@@ -33,8 +37,7 @@ def _reconstruct_from_laplacian(lap, residual):
 def _riesz_transform(band: np.ndarray):
     """
     Aproksimacija 2D Riesz transformacije prek gradientov (Sobel).
-    Vrne (Rx, Ry), Rnorm in monogenic amplitude A = sqrt(band^2 + Rnorm^2)
-    ter fazo phi = atan2(Rnorm, band).
+    Vrne (Rx, Ry), Rnorm, monogenic amplitudo A in fazo phi.
     """
     Rx = cv2.Sobel(band, cv2.CV_32F, 1, 0, ksize=3) / 8.0
     Ry = cv2.Sobel(band, cv2.CV_32F, 0, 1, ksize=3) / 8.0
@@ -44,7 +47,7 @@ def _riesz_transform(band: np.ndarray):
     return Rx, Ry, Rnorm, A, phi
 
 class _IIRBandpass:
-    """Dvo-polni IIR band-pass za fazo (na vsakem piksli posebej)."""
+    """Dvo-polni IIR band-pass (po pikslih) za fazo."""
     def __init__(self, low_hz: float, high_hz: float, fps: float, shape):
         aH = math.exp(-2*math.pi*high_hz / fps)
         aL = math.exp(-2*math.pi*low_hz  / fps)
@@ -67,20 +70,17 @@ class RieszMotionMagnifier:
     Phase-based motion magnification z monogenic (Riesz) signalom po Laplaceovi piramidi.
     - levels: št. nivojev piramide (1..5)
     - low/high: časovni pas v Hz
-    - fps: vzorčna frekvenca
+    - fps: frekvenca vzorčenja
     """
     def __init__(self, levels: int, low_hz: float, high_hz: float, fps: float, shape_hw):
         self.levels = int(max(1, min(5, levels)))
         self.low = float(low_hz)
         self.high = float(high_hz)
         self.fps = float(fps)
-
-        # IIR za fazo na vsakem nivoju
         self.filters = None
         self._init_filters(shape_hw)
 
     def _init_filters(self, shape_hw):
-        # zgradi dummy piramido samo za oblike nivojev
         zeros = np.zeros(shape_hw, np.float32)
         lap, _ = _build_laplacian_pyramid(zeros, self.levels)
         self.filters = [ _IIRBandpass(self.low, self.high, self.fps, l.shape) for l in lap ]
@@ -94,26 +94,32 @@ class RieszMotionMagnifier:
 
     def magnify(self, gray01: np.ndarray, alpha: float) -> np.ndarray:
         """
-        Vhod: gray01 (float32, 0..1), izhod: magnified gray v 0..1 (float32).
+        Vhod: gray01 (float32, 0..1), izhod: magnified gray (float32, 0..1).
+        alpha = UI “Amplification”; efektivno ojačanje faze se λ-odvisno skalira in omeji.
         """
         img = gray01.astype(np.float32)
 
         # 1) Laplaceova piramida
         lap, residual = _build_laplacian_pyramid(img, self.levels)
 
-        # 2) Po nivojih: monogenic faza -> IIR band-pass -> amplifikacija -> rekonstrukcija banda
+        # 2) Po nivojih: Riesz → faza → IIR band-pass → λ-odvisno ojačanje → rekonstrukcija banda
         out_lap = []
         for i, band in enumerate(lap):
             Rx, Ry, Rnorm, A, phi = _riesz_transform(band)
             bp = self.filters[i].update(phi)  # band-passed phase
-            phi_amp = phi + alpha * bp
-            # rekonstrukcija banda iz amplitude in nove faze
+
+            # --- λ-odvisna efektivna ojačitev faze ---
+            # približna valovna dolžina na ravni i (v px): večji nivo → daljša λ
+            lam = float(2 ** (i + 1))
+            # stabilnostna meja ~ λ/8; večje ojačitve povzročijo popačenja
+            alpha_eff = min(alpha * (lam / 8.0), lam / 8.0)
+
+            phi_amp = phi + alpha_eff * bp
+
+            # rekonstrukcija even-komponente (Laplacian band) iz amplitude in nove faze
             band_out = A * np.cos(phi_amp)
             out_lap.append(band_out)
 
-        # 3) Rekonstrukcija slike
+        # 3) Rekonstrukcija slike in omejitev na 0..1
         out = _reconstruct_from_laplacian(out_lap, residual)
-
-        # 4) Omeji na 0..1
-        return np.clip(out, 0.0, 1.0)
-
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
