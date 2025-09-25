@@ -19,8 +19,7 @@ jobs:
 
       - name: Build (PyInstaller, onedir)
         run: |
-          pyinstaller --noconfirm --windowed --name LiveVideoMagnification app/main.py ^
-            --collect-all PySide6 --collect-all cv2
+          pyinstaller --noconfirm --windowed --name LiveVideoMagnification app/main.py --collect-all PySide6 --collect-all cv2
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -33,4 +32,3 @@ jobs:
         with:
           name: LiveVideoMagnification-Installer
           path: output/*.exe
-
