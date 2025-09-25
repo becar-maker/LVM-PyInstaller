@@ -1,9 +1,9 @@
 import sys, cv2, numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from roi_label import VideoLabel
-from eulerian import TemporalIIRBandpass
+from riesz import RieszMotionMagnifier
 
-APP_TITLE = "Live Video Magnification (Python)"
+APP_TITLE = "Live Video Magnification (Riesz Motion)"
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -11,13 +11,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1100, 700)
 
-        # --- video view
+        # video view
         self.label = VideoLabel()
         self.label.setMinimumSize(640, 360)
         self.label.roiChanged.connect(self.on_roi_changed)
         self.setCentralWidget(self.label)
 
-        # --- right dock with controls
+        # controls dock
         dock = QtWidgets.QDockWidget("Controls", self)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         w = QtWidgets.QWidget()
@@ -29,13 +29,17 @@ class MainWindow(QtWidgets.QMainWindow):
         hb = QtWidgets.QHBoxLayout(); hb.addWidget(self.btn_open); hb.addWidget(self.btn_play)
         form.addRow(hb)
 
-        # fps + band
+        # fps + band (Hz)
         self.spin_fps  = QtWidgets.QDoubleSpinBox(); self.spin_fps.setRange(1,1000); self.spin_fps.setValue(30); self.spin_fps.setSuffix(" fps")
         self.spin_low  = QtWidgets.QDoubleSpinBox(); self.spin_low.setRange(0.01,200); self.spin_low.setValue(2.0); self.spin_low.setSuffix(" Hz")
         self.spin_high = QtWidgets.QDoubleSpinBox(); self.spin_high.setRange(0.05,300); self.spin_high.setValue(8.0); self.spin_high.setSuffix(" Hz")
         form.addRow("FPS (override):", self.spin_fps)
         form.addRow("Low cut (Hz):",   self.spin_low)
         form.addRow("High cut (Hz):",  self.spin_high)
+
+        # Riesz pyramid levels
+        self.spin_levels = QtWidgets.QSpinBox(); self.spin_levels.setRange(1,5); self.spin_levels.setValue(3)
+        form.addRow("Levels:", self.spin_levels)
 
         # amplification – up to 100× (0.01× step)
         self.slider_amp = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -57,6 +61,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_open.clicked.connect(self.open_video)
         self.btn_play.toggled.connect(self.toggle_play)
         self.slider_amp.valueChanged.connect(lambda v: self.lbl_amp.setText(f"{v/100:.2f}×"))
+        # sprememba parametrov -> ponastavi magnifier ob naslednjem kadru
+        self.spin_fps.valueChanged.connect(self.invalidate_magnifier)
+        self.spin_low.valueChanged.connect(self.invalidate_magnifier)
+        self.spin_high.valueChanged.connect(self.invalidate_magnifier)
+        self.spin_levels.valueChanged.connect(self.invalidate_magnifier)
 
         # state
         self.cap = None
@@ -65,8 +74,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.timer.timeout.connect(self.next_frame)
-        self.iir = None
+        self.magnifier = None
         self.roi = None  # (x,y,w,h)
+
+    def invalidate_magnifier(self):
+        self.magnifier = None
 
     # --- open video
     def open_video(self):
@@ -97,7 +109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self.frame_idx = 0
 
-        self.iir = None
+        self.magnifier = None
         self.roi = None
         self.label.clear_roi()
         self.btn_play.setChecked(False)
@@ -122,11 +134,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.roi = None
             self.statusBar().showMessage("ROI cleared")
             self.lbl_roi.setText("ROI: full frame")
-            self.iir = None
+            self.magnifier = None
         else:
             self.roi = (rect.x(), rect.y(), rect.width(), rect.height())
             self.lbl_roi.setText(f"ROI: x={rect.x()} y={rect.y()} w={rect.width()} h={rect.height()}")
-            self.iir = None  # reinit filters for new ROI
+            self.magnifier = None  # reinit for new ROI
 
     # --- frame loop
     def next_frame(self):
@@ -148,22 +160,32 @@ class MainWindow(QtWidgets.QMainWindow):
         x, y, w, h = (0, 0, frame.shape[1], frame.shape[0]) if not self.roi else self.roi
 
         roi_view = frame[y:y+h, x:x+w]
-        gray = cv2.cvtColor(roi_view, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        # ker imaš črno-beli vir: če je 1-kanalno, vzemi direktno; sicer pretvori v gray
+        if roi_view.ndim == 2:
+            gray = roi_view.astype(np.float32) / 255.0
+        else:
+            # tudi če je “B/W v 3 kanalih”, to samo izbere svetlost
+            gray = cv2.cvtColor(roi_view, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
-        if self.iir is None:
+        # inicializacija Riesz magnifier-ja
+        if self.magnifier is None:
             fps  = float(self.spin_fps.value())
             low  = float(self.spin_low.value())
             high = float(self.spin_high.value())
             high = min(high, fps/2 - 0.01)
             if high <= low: high = low + 0.01
             self.spin_high.setValue(high)
-            self.iir = TemporalIIRBandpass(low, high, fps, shape=gray.shape)
+            levels = int(self.spin_levels.value())
+            self.magnifier = RieszMotionMagnifier(levels, low, high, fps, shape_hw=gray.shape)
 
-        band = self.iir.update(gray)
-        amp = self.slider_amp.value() / 100.0    # 0 … 100.00
-        out = np.clip(gray + amp * band, 0.0, 1.0)
+        alpha = self.slider_amp.value() / 100.0   # 0 … 100.00
+        out = self.magnifier.magnify(gray, alpha)
 
-        out_bgr = cv2.cvtColor((out * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        out_u8 = (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+        if roi_view.ndim == 2:
+            out_bgr = cv2.cvtColor(out_u8, cv2.COLOR_GRAY2BGR)
+        else:
+            out_bgr = cv2.cvtColor(out_u8, cv2.COLOR_GRAY2BGR)
         disp[y:y+h, x:x+w] = out_bgr
 
         self.show_frame(disp)
