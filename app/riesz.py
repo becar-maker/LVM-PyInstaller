@@ -68,9 +68,11 @@ class _IIRBandpass:
 class RieszMotionMagnifier:
     """
     Phase-based motion magnification z monogenic (Riesz) signalom po Laplaceovi piramidi.
-    - levels: št. nivojev piramide (1..5)
-    - low/high: časovni pas v Hz
-    - fps: frekvenca vzorčenja
+
+    ***Pomembno***: parameter `alpha` v `magnify()` tukaj pomeni neposredno
+    **faktor premika M**. Če v UI nastaviš 50.00×, potem M=50 in velja:
+        u' = M * u  (za band-pass del premika)
+    zato fazne spremembe (Δφ) množimo z (M-1), statične faze pa ne spreminjamo.
     """
     def __init__(self, levels: int, low_hz: float, high_hz: float, fps: float, shape_hw):
         self.levels = int(max(1, min(5, levels)))
@@ -94,27 +96,25 @@ class RieszMotionMagnifier:
 
     def magnify(self, gray01: np.ndarray, alpha: float) -> np.ndarray:
         """
-        Vhod: gray01 (float32, 0..1), izhod: magnified gray (float32, 0..1).
-        alpha = UI “Amplification”; efektivno ojačanje faze se λ-odvisno skalira in omeji.
+        Vhod: gray01 (float32, 0..1)
+        Izhod: magnified gray (float32, 0..1)
+        `alpha` = M (ciljni faktor premika). Δφ ojačamo z (M-1) enako na vseh ravneh,
+        tako da je premik skaliran konsistentno (u' = M·u) ne glede na prostorsko skalo.
         """
         img = gray01.astype(np.float32)
 
         # 1) Laplaceova piramida
         lap, residual = _build_laplacian_pyramid(img, self.levels)
 
-        # 2) Po nivojih: Riesz → faza → IIR band-pass → λ-odvisno ojačanje → rekonstrukcija banda
+        # 2) Po nivojih: Riesz → faza → IIR band-pass → uniformno ojačanje → rekonstrukcija banda
         out_lap = []
+        phase_gain = (alpha - 1.0)  # če alpha==1 → brez spremembe; alpha==50 → Δφ * 49
         for i, band in enumerate(lap):
             Rx, Ry, Rnorm, A, phi = _riesz_transform(band)
-            bp = self.filters[i].update(phi)  # band-passed phase
+            bp = self.filters[i].update(phi)  # band-passed phase (Δφ v radianih)
 
-            # --- λ-odvisna efektivna ojačitev faze ---
-            # približna valovna dolžina na ravni i (v px): večji nivo → daljša λ
-            lam = float(2 ** (i + 1))
-            # stabilnostna meja ~ λ/8; večje ojačitve povzročijo popačenja
-            alpha_eff = min(alpha * (lam / 8.0), lam / 8.0)
-
-            phi_amp = phi + alpha_eff * bp
+            # uniformno povečaj fazno spremembo, da dosežeš u' = alpha * u
+            phi_amp = phi + phase_gain * bp
 
             # rekonstrukcija even-komponente (Laplacian band) iz amplitude in nove faze
             band_out = A * np.cos(phi_amp)
