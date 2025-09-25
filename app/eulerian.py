@@ -13,4 +13,3 @@ class TemporalIIRBandpass:
         self.yH = (1.0-self.aH)*x + self.aH*self.yH
         self.yL = (1.0-self.aL)*x + self.aL*self.yL
         return self.yH - self.yL
-
