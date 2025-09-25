@@ -36,4 +36,3 @@ class VideoLabel(QtWidgets.QLabel):
             p=QtGui.QPainter(self); p.setRenderHint(QtGui.QPainter.Antialiasing)
             p.setPen(QtGui.QPen(QtGui.QColor(0,200,255),2,QtCore.Qt.DashLine))
             p.drawRect(self._roi)
-
