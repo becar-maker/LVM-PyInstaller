@@ -67,8 +67,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_high = QtWidgets.QDoubleSpinBox(); self.spin_high.setRange(0.05,300); self.spin_high.setValue(8.0); self.spin_high.setSuffix(" Hz")
         self.spin_levels = QtWidgets.QSpinBox(); self.spin_levels.setRange(1,5); self.spin_levels.setValue(3)
 
-        self.slider_amp = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.slider_amp.setRange(0, 10000); self.slider_amp.setValue(100)
-        self.lbl_amp = QtWidgets.QLabel("1.00×")
+        # Amplification = M (1 … 100×), brez deljenja
+        self.slider_amp = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_amp.setRange(1, 100)        # neposreden faktor
+        self.slider_amp.setValue(50)            # npr. 50×
+        self.lbl_amp = QtWidgets.QLabel(f"{self.slider_amp.value()}×")
+        amp_row = QtWidgets.QHBoxLayout(); amp_row.addWidget(self.slider_amp); amp_row.addWidget(self.lbl_amp)
 
         self.chk_loop = QtWidgets.QCheckBox("Loop at end"); self.chk_loop.setChecked(True)
 
@@ -76,7 +80,6 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(QtWidgets.QLabel("Low cut (Hz):"),   r, 0); grid.addWidget(self.spin_low, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("High cut (Hz):"),  r, 0); grid.addWidget(self.spin_high, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("Levels:"),         r, 0); grid.addWidget(self.spin_levels, r, 1); r+=1
-        amp_row = QtWidgets.QHBoxLayout(); amp_row.addWidget(self.slider_amp); amp_row.addWidget(self.lbl_amp)
         grid.addWidget(QtWidgets.QLabel("Amplification:"),  r, 0); grid.addLayout(amp_row, r, 1); r+=1
         grid.addWidget(self.chk_loop, r, 0, 1, 2); r+=1
 
@@ -97,7 +100,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save.clicked.connect(self.save_as)
         self.btn_export.clicked.connect(self.export_mp4)
 
-        self.slider_amp.valueChanged.connect(lambda v: self.lbl_amp.setText(f"{v/100:.2f}×"))
+        self.slider_amp.valueChanged.connect(lambda v: self.lbl_amp.setText(f"{v}×"))
         self.slider_speed.valueChanged.connect(self.on_speed_changed)
 
         for w in (self.spin_fps, self.spin_low, self.spin_high, self.spin_levels):
@@ -205,7 +208,7 @@ class MainWindow(QtWidgets.QMainWindow):
         high = min(high, fps/2 - 0.01)
         if high <= low: high = low + 0.01
         levels = int(self.spin_levels.value())
-        alpha = self.slider_amp.value() / 100.0
+        alpha = float(self.slider_amp.value())     # M = 1 … 100
 
         base, _ = os.path.splitext(self.src_path)
         out_path = base + "_magnified.avi"   # MJPG for accurate seeking
@@ -309,7 +312,6 @@ class MainWindow(QtWidgets.QMainWindow):
         W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(self.spin_fps.value())
 
-        # poskusi v tem vrstnem redu: avc1 (H.264), H264, mp4v (fallback)
         def try_writer(code):
             fourcc = cv2.VideoWriter_fourcc(*code)
             writer = cv2.VideoWriter(dst, fourcc, fps, (W, H))
