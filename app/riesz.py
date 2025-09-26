@@ -3,7 +3,6 @@ import cv2
 import math
 
 _EPS = 1e-8
-PI = math.pi
 
 # ---------- Laplaceova piramida ----------
 def _pyr_down(img):
@@ -44,49 +43,27 @@ def _riesz_components(band: np.ndarray):
     Ry = cv2.filter2D(band, cv2.CV_32F, KY, borderType=cv2.BORDER_REPLICATE)
     return Rx, Ry
 
-# ---------- normaliziran IIR band-pass ----------
-def _lp_mag(a: float, omega: float) -> float:
+# ---------- preprost IIR band-pass (razlika dveh enopolnih LP) ----------
+class _IIRBandpass:
     """
-    Magnituda enopolnega LP filtra y = (1-a)x + a y[-1] pri kotni frekvenci omega (rad/sample).
-    |H_lp(e^jω)| = (1-a) / sqrt(1 + a^2 - 2 a cos ω)
-    """
-    num = 1.0 - a
-    den = math.sqrt(1.0 + a*a - 2.0*a*math.cos(omega))
-    return num / max(den, 1e-12)
-
-class _NormIIRBandpass:
-    """
-    Band-pass kot razlika dveh enopolnih LP (pri fH in fL), a z **normalizacijo gaina**
-    na središčni frekvenci fC = sqrt(fL * fH). To stabilizira amplitudo Δφ, da se
-    ojačanje M obnaša linearno (npr. 30× → 60× ≈ 2× večji premik).
+    Dva enopolna LP filtra pri fH in fL → band = LP(fH) - LP(fL).
+    Stabilno, hitro, brez dodatne normalizacije.
     """
     def __init__(self, low_hz: float, high_hz: float, fps: float, shape):
-        assert low_hz > 0 and high_hz > low_hz and fps > 0
         self.aH = float(math.exp(-2 * math.pi * high_hz / fps))
         self.aL = float(math.exp(-2 * math.pi * low_hz  / fps))
         self.yH = np.zeros(shape, np.float32)
         self.yL = np.zeros(shape, np.float32)
         self.initialized = False
 
-        # center frequency & normalizacija magnitude pri fC
-        fC = math.sqrt(low_hz * high_hz)
-        omega_c = 2.0 * math.pi * (fC / fps)
-        gH = _lp_mag(self.aH, omega_c)
-        gL = _lp_mag(self.aL, omega_c)
-        G = gH - gL
-        # če je G zelo majhen (robni primer), se izognemo eksploziji gaina
-        self.norm = 1.0 / G if abs(G) > 1e-6 else 1.0
-
     def update(self, x: np.ndarray) -> np.ndarray:
         if not self.initialized:
             self.yH[...] = x
             self.yL[...] = x
             self.initialized = True
-        # LP s poloma aH in aL
         self.yH = (1.0 - self.aH) * x + self.aH * self.yH
         self.yL = (1.0 - self.aL) * x + self.aL * self.yL
-        # normaliziran band-pass
-        return (self.yH - self.yL) * self.norm
+        return self.yH - self.yL
 
 # ---------- amplitudno uteženo glajenje ----------
 def _amp_weighted_blur(signal: np.ndarray, amplitude: np.ndarray, sigma: float) -> np.ndarray:
@@ -101,8 +78,16 @@ def _amp_weighted_blur(signal: np.ndarray, amplitude: np.ndarray, sigma: float) 
 # ---------- glavna klasa ----------
 class RieszMotionMagnifier:
     """
-    MATLAB-like kvaternionična Riesz magnifikacija z **normaliziranim band-passom**.
-    `alpha` = M (Amplification: 1..100) — ciljni faktor premika band-pass komponente.
+    MATLAB-like kvaternionična Riesz magnifikacija gibanja.
+    `alpha` = M (Amplification: 1..100) — ciljni faktor premika za band-pass komponento.
+    Koraki:
+      - Laplace piramida
+      - Riesz (3×3) → q = (a, Rx, Ry)
+      - kvaternionična fazna razlika: q_cur * conj(q_prev) → (r, vx, vy)
+      - časovna kumulacija (unwrap) projekcij (cos, sin)
+      - IIR band-pass (brez normalizacije)
+      - soft maska m = A/(A+τ) in amplitudno uteženo glajenje (σ)
+      - ojačanje (M-1), phase-shift, vrnemo nov even del (band_out)
     """
     def __init__(self, levels: int, low_hz: float, high_hz: float, fps: float, shape_hw):
         self.levels = int(max(1, min(5, levels)))
@@ -110,8 +95,9 @@ class RieszMotionMagnifier:
         self.high = float(high_hz)
         self.fps = float(fps)
 
-        # manj glajenja, da se razlike M bolje vidijo; po potrebi zvišaj na 1.0
-        self.blur_sigma = 0.5
+        # Nastavitve stabilnosti
+        self.blur_sigma = 1.2     # Gauss σ za amplitudno uteženo glajenje (0.0 za izklop)
+        self.tau_mask   = 0.2     # τ v m = A/(A+τ); večji τ → manj ojačanja v šibkih območjih
 
         # per-level stanje
         self.prev_a = None
@@ -121,6 +107,7 @@ class RieszMotionMagnifier:
         self.cum_sin = None
         self.bp_cos = None
         self.bp_sin = None
+        self.level_gain = None  # per-skalen gain (privzeto 1.0)
         self._init_state(shape_hw)
 
     def _init_state(self, shape_hw):
@@ -135,8 +122,10 @@ class RieszMotionMagnifier:
         self.cum_cos = [ np.zeros(s, np.float32) for s in shp ]
         self.cum_sin = [ np.zeros(s, np.float32) for s in shp ]
 
-        self.bp_cos  = [ _NormIIRBandpass(self.low, self.high, self.fps, s) for s in shp ]
-        self.bp_sin  = [ _NormIIRBandpass(self.low, self.high, self.fps, s) for s in shp ]
+        self.bp_cos  = [ _IIRBandpass(self.low, self.high, self.fps, s) for s in shp ]
+        self.bp_sin  = [ _IIRBandpass(self.low, self.high, self.fps, s) for s in shp ]
+
+        self.level_gain = [1.0 for _ in shp]  # po potrebi lahko kasneje uglasimo
 
     def reinit(self, levels: int, low_hz: float, high_hz: float, fps: float, shape_hw):
         self.levels = int(max(1, min(5, levels)))
@@ -157,6 +146,7 @@ class RieszMotionMagnifier:
         lap, residual = _build_laplacian_pyramid(img, self.levels)
 
         out_lap = []
+        gain = alpha - 1.0
         for i, band in enumerate(lap):
             a = band.astype(np.float32)  # even
             Rx, Ry = _riesz_components(a)  # odd
@@ -173,12 +163,13 @@ class RieszMotionMagnifier:
                 out_lap.append(a)
                 continue
 
-            # q_cur * conj(q_prev) → (r, vx, vy)
+            # 2) kvaternionična fazna razlika: q_cur * conj(q_prev) → (r, vx, vy)
             r  = a*pa + Rx*prx + Ry*pry
             vx = pa*Rx - a*prx
             vy = pa*Ry - a*pry
 
             norm = np.sqrt(r*r + vx*vx + vy*vy) + _EPS
+            # fazni kot v [0, π]
             phase = np.clip(r / norm, -1.0, 1.0)
             phase = np.arccos(phase)
 
@@ -186,25 +177,34 @@ class RieszMotionMagnifier:
             cos_t = vx / vnorm
             sin_t = vy / vnorm
 
-            # časovna kumulacija projekcij (unwrap)
+            # 3) časovna kumulacija (unwrap)
             self.cum_cos[i] += phase * cos_t
             self.cum_sin[i] += phase * sin_t
 
-            # **normaliziran** IIR band-pass
+            # 4) IIR band-pass (brez normalizacije)
             fcos = self.bp_cos[i].update(self.cum_cos[i])
             fsin = self.bp_sin[i].update(self.cum_sin[i])
 
-            # amplitudno uteženo glajenje (manjše kot prej)
+            # 5) soft maska po amplitudi (stabilnost v šibkih območjih)
+            m = A / (A + self.tau_mask)
+            fcos *= m
+            fsin *= m
+
+            # 6) amplitudno uteženo glajenje
             if self.blur_sigma > 0.0:
                 fcos = _amp_weighted_blur(fcos, A, self.blur_sigma)
                 fsin = _amp_weighted_blur(fsin, A, self.blur_sigma)
 
-            # ojačanje (M-1)
-            gain = (alpha - 1.0)
+            # 7) per-skalen gain (privzeto 1.0; možnost uglasitve)
+            g = float(self.level_gain[i])
+            fcos *= g
+            fsin *= g
+
+            # 8) ojačanje (M-1)
             fcos *= gain
             fsin *= gain
 
-            # phase-shift: q_out = exp(n*θ) * q_cur
+            # 9) phase-shift: q_out = exp(n*θ) * q_cur
             mag = np.sqrt(fcos*fcos + fsin*fsin) + _EPS
             exp_r  = np.cos(mag)
             s_over = np.sin(mag) / mag
