@@ -208,9 +208,7 @@ class MainWindow(QtWidgets.QMainWindow):
         high = min(high, fps/2 - 0.01)
         if high <= low: high = low + 0.01
         levels = int(self.spin_levels.value())
-
-        # *** ključno: slider 1–100 → efektivno M = 10–1000
-        alpha = float(self.slider_amp.value()) * 10.0
+        alpha = float(self.slider_amp.value())     # M = 1 … 100
 
         base, _ = os.path.splitext(self.src_path)
         out_path = base + "_magnified.avi"   # MJPG for accurate seeking
