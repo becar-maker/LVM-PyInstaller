@@ -59,7 +59,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row2.addWidget(self.lbl_speed)
         vbox.addLayout(row2)
 
-        # --- Parametri (FPS, pas, levels, amplification, loop) ---
+        # --- Parametri (FPS, pas, levels, amplification, loop, calibration) ---
         grid = QtWidgets.QGridLayout()
         r = 0
         self.spin_fps  = QtWidgets.QDoubleSpinBox(); self.spin_fps.setRange(1,1000); self.spin_fps.setValue(30); self.spin_fps.setSuffix(" fps")
@@ -76,11 +76,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.chk_loop = QtWidgets.QCheckBox("Loop at end"); self.chk_loop.setChecked(True)
 
+        # --- NEW: Calibration to MATLAB (optional, privzeto OFF) ---
+        self.chk_cal = QtWidgets.QCheckBox("Calibration to MATLAB")
+        self.chk_cal.setChecked(False)  # pusti "original" vedenje privzeto
+        self.spin_cal = QtWidgets.QDoubleSpinBox()
+        self.spin_cal.setRange(0.10, 5.00)
+        self.spin_cal.setDecimals(2)
+        self.spin_cal.setSingleStep(0.10)
+        self.spin_cal.setValue(2.00)    # ker si opazil, da tu treba ~2×
+        self.spin_cal.setSuffix("×")
+        cal_row = QtWidgets.QHBoxLayout(); cal_row.addWidget(self.chk_cal); cal_row.addStretch(1); cal_row.addWidget(QtWidgets.QLabel("k:")); cal_row.addWidget(self.spin_cal)
+
         grid.addWidget(QtWidgets.QLabel("FPS (override):"), r, 0); grid.addWidget(self.spin_fps, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("Low cut (Hz):"),   r, 0); grid.addWidget(self.spin_low, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("High cut (Hz):"),  r, 0); grid.addWidget(self.spin_high, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("Levels:"),         r, 0); grid.addWidget(self.spin_levels, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("Amplification:"),  r, 0); grid.addLayout(amp_row, r, 1); r+=1
+        grid.addLayout(cal_row, r, 0, 1, 2); r+=1
         grid.addWidget(self.chk_loop, r, 0, 1, 2); r+=1
 
         grid_box = QtWidgets.QGroupBox("Parameters")
@@ -103,8 +115,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider_amp.valueChanged.connect(lambda v: self.lbl_amp.setText(f"{v}×"))
         self.slider_speed.valueChanged.connect(self.on_speed_changed)
 
-        for w in (self.spin_fps, self.spin_low, self.spin_high, self.spin_levels):
+        for w in (self.spin_fps, self.spin_low, self.spin_high, self.spin_levels, self.spin_cal):
             w.valueChanged.connect(self.invalidate_processed)
+        self.chk_cal.stateChanged.connect(self.invalidate_processed)
 
         self.slider_timeline.sliderPressed.connect(self.pause_for_seek)
         self.slider_timeline.sliderReleased.connect(self.seek_to_slider)
@@ -208,7 +221,11 @@ class MainWindow(QtWidgets.QMainWindow):
         high = min(high, fps/2 - 0.01)
         if high <= low: high = low + 0.01
         levels = int(self.spin_levels.value())
-        alpha = float(self.slider_amp.value())     # M = 1 … 100
+
+        # Amplification (1..100), z opcijsko kalibracijo
+        alpha = float(self.slider_amp.value())
+        if self.chk_cal.isChecked():
+            alpha *= float(self.spin_cal.value())
 
         base, _ = os.path.splitext(self.src_path)
         out_path = base + "_magnified.avi"   # MJPG for accurate seeking
