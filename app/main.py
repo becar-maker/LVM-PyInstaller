@@ -1,9 +1,25 @@
 import sys, os, shutil, cv2, numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from roi_label import VideoLabel
-from riesz import RieszMotionMagnifier
+from backend_riesz import RieszBackend
 
-APP_TITLE = "Live Video Magnification (Riesz Motion)"
+APP_TITLE = "Live Video Magnification (Python)"
+
+# poskusno uvozimo steerable; če manjka pyrtools, bo None
+try:
+    from backend_steerable import SteerableBackend
+    HAS_STEERABLE = True
+except Exception:
+    SteerableBackend = None
+    HAS_STEERABLE = False
+
+def make_backend(engine_name: str):
+    if engine_name.startswith("Riesz"):
+        return RieszBackend()
+    if engine_name.startswith("Steerable") and HAS_STEERABLE:
+        return SteerableBackend(norient=4)  # lahko kasneje dodaš nastavljivo
+    # fallback
+    return RieszBackend()
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -11,22 +27,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1200, 780)
 
-        # === CENTRALNI LAYOUT: VIDEO ZGORAJ, ORODJA SPODAJ ===
         central = QtWidgets.QWidget()
         vbox = QtWidgets.QVBoxLayout(central)
         vbox.setContentsMargins(10, 10, 10, 10)
         vbox.setSpacing(10)
 
-        # --- video view ---
         self.label = VideoLabel()
         self.label.setMinimumSize(720, 405)
         self.label.roiChanged.connect(self.on_roi_changed)
         vbox.addWidget(self.label, stretch=1)
 
-        # --- Playback vrstica (Open/Transform/Play/Stop/Save/Export MP4) ---
         row1 = QtWidgets.QHBoxLayout()
         self.btn_open = QtWidgets.QPushButton("Open")
-        self.btn_transform = QtWidgets.QPushButton("Transform (Riesz)")
+        self.btn_transform = QtWidgets.QPushButton("Transform")
         self.btn_play = QtWidgets.QPushButton("Play"); self.btn_play.setCheckable(True)
         self.btn_stop = QtWidgets.QPushButton("Stop")
         self.btn_save = QtWidgets.QPushButton("Save As…")
@@ -42,7 +55,6 @@ class MainWindow(QtWidgets.QMainWindow):
         row1.addWidget(self.btn_export)
         vbox.addLayout(row1)
 
-        # --- Timeline + Slow speed ---
         row2 = QtWidgets.QHBoxLayout()
         self.slider_timeline = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.slider_timeline.setRange(0, 0)
         self.lbl_time = QtWidgets.QLabel("00:00 / 00:00")
@@ -51,42 +63,43 @@ class MainWindow(QtWidgets.QMainWindow):
         row2.addWidget(self.lbl_time)
         row2.addSpacing(20)
         self.slider_speed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider_speed.setRange(1, 100)      # 1% … 100%
-        self.slider_speed.setValue(100)         # default 100%
+        self.slider_speed.setRange(1, 100)
+        self.slider_speed.setValue(100)
         self.lbl_speed = QtWidgets.QLabel("Speed: 100%")
         row2.addWidget(QtWidgets.QLabel("Slow speed:"))
         row2.addWidget(self.slider_speed)
         row2.addWidget(self.lbl_speed)
         vbox.addLayout(row2)
 
-        # --- Parametri (FPS, pas, levels, amplification, loop, calibration) ---
         grid = QtWidgets.QGridLayout()
         r = 0
-        self.spin_fps  = QtWidgets.QDoubleSpinBox(); self.spin_fps.setRange(1,1000); self.spin_fps.setValue(30); self.spin_fps.setSuffix(" fps")
-        self.spin_low  = QtWidgets.QDoubleSpinBox(); self.spin_low.setRange(0.01,200); self.spin_low.setValue(2.0); self.spin_low.setSuffix(" Hz")
-        self.spin_high = QtWidgets.QDoubleSpinBox(); self.spin_high.setRange(0.05,300); self.spin_high.setValue(8.0); self.spin_high.setSuffix(" Hz")
-        self.spin_levels = QtWidgets.QSpinBox(); self.spin_levels.setRange(1,5); self.spin_levels.setValue(3)
+        # ENGINE (novo)
+        self.combo_engine = QtWidgets.QComboBox()
+        self.combo_engine.addItem("Riesz (original)")
+        if HAS_STEERABLE:
+            self.combo_engine.addItem("Steerable (pyrtools, experimental)")
+        self.combo_engine.setCurrentIndex(0)
 
-        # Amplification slider: 1 … 100 (label prikazuje ×1 … ×100)
+        self.spin_fps  = QtWidgets.QDoubleSpinBox(); self.spin_fps.setRange(1,1000); self.spin_fps.setValue(30); self.spin_fps.setSuffix(" fps")
+        self.spin_low  = QtWidgets.QDoubleSpinBox(); self.spin_low.setRange(0.01,200); self.spin_low.setValue(10.0); self.spin_low.setSuffix(" Hz")
+        self.spin_high = QtWidgets.QDoubleSpinBox(); self.spin_high.setRange(0.05,300); self.spin_high.setValue(13.0); self.spin_high.setSuffix(" Hz")
+        self.spin_levels = QtWidgets.QSpinBox(); self.spin_levels.setRange(1,5); self.spin_levels.setValue(5)
+
         self.slider_amp = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider_amp.setRange(1, 100)
-        self.slider_amp.setValue(50)
+        self.slider_amp.setValue(60)
         self.lbl_amp = QtWidgets.QLabel(f"{self.slider_amp.value()}×")
         amp_row = QtWidgets.QHBoxLayout(); amp_row.addWidget(self.slider_amp); amp_row.addWidget(self.lbl_amp)
 
         self.chk_loop = QtWidgets.QCheckBox("Loop at end"); self.chk_loop.setChecked(True)
 
-        # --- NEW: Calibration to MATLAB (optional, privzeto OFF) ---
         self.chk_cal = QtWidgets.QCheckBox("Calibration to MATLAB")
-        self.chk_cal.setChecked(False)  # pusti "original" vedenje privzeto
+        self.chk_cal.setChecked(False)
         self.spin_cal = QtWidgets.QDoubleSpinBox()
-        self.spin_cal.setRange(0.10, 5.00)
-        self.spin_cal.setDecimals(2)
-        self.spin_cal.setSingleStep(0.10)
-        self.spin_cal.setValue(2.00)    # ker si opazil, da tu treba ~2×
-        self.spin_cal.setSuffix("×")
+        self.spin_cal.setRange(0.10, 5.00); self.spin_cal.setDecimals(2); self.spin_cal.setSingleStep(0.10); self.spin_cal.setValue(2.00); self.spin_cal.setSuffix("×")
         cal_row = QtWidgets.QHBoxLayout(); cal_row.addWidget(self.chk_cal); cal_row.addStretch(1); cal_row.addWidget(QtWidgets.QLabel("k:")); cal_row.addWidget(self.spin_cal)
 
+        grid.addWidget(QtWidgets.QLabel("Engine:"),        r, 0); grid.addWidget(self.combo_engine, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("FPS (override):"), r, 0); grid.addWidget(self.spin_fps, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("Low cut (Hz):"),   r, 0); grid.addWidget(self.spin_low, r, 1); r+=1
         grid.addWidget(QtWidgets.QLabel("High cut (Hz):"),  r, 0); grid.addWidget(self.spin_high, r, 1); r+=1
@@ -100,11 +113,8 @@ class MainWindow(QtWidgets.QMainWindow):
         vbox.addWidget(grid_box)
 
         self.setCentralWidget(central)
-
-        # --- Status bar ---
         self.setStatusBar(QtWidgets.QStatusBar(self))
 
-        # === SIGNALI ===
         self.btn_open.clicked.connect(self.open_video)
         self.btn_transform.clicked.connect(self.transform_video)
         self.btn_play.toggled.connect(self.toggle_play)
@@ -118,28 +128,17 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in (self.spin_fps, self.spin_low, self.spin_high, self.spin_levels, self.spin_cal):
             w.valueChanged.connect(self.invalidate_processed)
         self.chk_cal.stateChanged.connect(self.invalidate_processed)
+        self.combo_engine.currentIndexChanged.connect(self.invalidate_processed)
 
         self.slider_timeline.sliderPressed.connect(self.pause_for_seek)
         self.slider_timeline.sliderReleased.connect(self.seek_to_slider)
 
-        # === STANJE ===
-        self.src_path = None
-        self.src_cap = None
-        self.src_fps = 30.0
-        self.src_frame_count = 0
+        self.src_path = None; self.src_cap = None; self.src_fps = 30.0; self.src_frame_count = 0
+        self.proc_path = None; self.play_cap = None; self.play_frame_count = 0; self.play_frame_idx = 0
+        self.timer = QtCore.QTimer(self); self.timer.setTimerType(QtCore.Qt.PreciseTimer); self.timer.timeout.connect(self.next_frame_play)
+        self.roi = None
 
-        self.proc_path = None
-        self.play_cap = None
-        self.play_frame_count = 0
-        self.play_frame_idx = 0
-
-        self.timer = QtCore.QTimer(self)
-        self.timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self.timer.timeout.connect(self.next_frame_play)
-
-        self.roi = None  # (x,y,w,h)
-
-    # --------- helpers ----------
+    # --- helperji (enaki kot prej) ---
     def on_speed_changed(self, v: int):
         self.lbl_speed.setText(f"Speed: {v}%")
         if self.btn_play.isChecked():
@@ -177,7 +176,6 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.update_time_label()
 
-    # --------- open / preview ----------
     def open_video(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Open video", "", "Video files (*.mp4 *.avi *.mkv *.mov *.mpg *.mpeg);;All files (*)")
@@ -207,7 +205,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.invalidate_processed()
         self.statusBar().showMessage(f"Opened: {os.path.basename(self.src_path)} ({self.src_fps:.2f} fps, {self.src_frame_count} frames)")
 
-    # --------- transform (offline) ----------
     def transform_video(self):
         if not self.src_cap or not self.src_path:
             QtWidgets.QMessageBox.warning(self, "No video", "Open a video first."); return
@@ -222,13 +219,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if high <= low: high = low + 0.01
         levels = int(self.spin_levels.value())
 
-        # Amplification (1..100), z opcijsko kalibracijo
         alpha = float(self.slider_amp.value())
         if self.chk_cal.isChecked():
             alpha *= float(self.spin_cal.value())
 
         base, _ = os.path.splitext(self.src_path)
-        out_path = base + "_magnified.avi"   # MJPG for accurate seeking
+        out_path = base + "_magnified.avi"
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
 
         cap = cv2.VideoCapture(self.src_path)
@@ -241,10 +237,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         prog = QtWidgets.QProgressDialog("Transforming…", "Cancel", 0, total if total>0 else 0, self)
-        prog.setWindowModality(QtCore.Qt.WindowModal)
-        prog.setMinimumDuration(0)
+        prog.setWindowModality(QtCore.Qt.WindowModal); prog.setMinimumDuration(0)
 
-        magnifier = None
+        # --- izberi engine ---
+        backend = make_backend(self.combo_engine.currentText())
+        try:
+            backend.reset(levels, low, high, fps, (h, w))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Engine init failed", str(e))
+            writer.release(); cap.release()
+            try: os.remove(out_path)
+            except: pass
+            return
+
         idx = 0
         ok, frame = cap.read()
         while ok:
@@ -254,10 +259,15 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 gray = cv2.cvtColor(roi_view, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
-            if magnifier is None:
-                magnifier = RieszMotionMagnifier(levels, low, high, fps, shape_hw=gray.shape)
+            try:
+                out = backend.magnify(gray, alpha)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Processing error", str(e))
+                writer.release(); cap.release()
+                try: os.remove(out_path)
+                except: pass
+                return
 
-            out = magnifier.magnify(gray, alpha)
             out_u8 = (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
             out_bgr = cv2.cvtColor(out_u8, cv2.COLOR_GRAY2BGR)
 
@@ -270,7 +280,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 prog.setValue(idx)
                 if prog.wasCanceled():
                     break
-
             ok, frame = cap.read()
 
         prog.setValue(total if total>0 else idx)
@@ -295,36 +304,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_frame(first_proc)
         self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self.update_time_label()
-        self.statusBar().showMessage(f"Transform done: {os.path.basename(self.proc_path)}")
+        self.statusBar().showMessage(f"Transform done ({self.combo_engine.currentText()}): {os.path.basename(self.proc_path)}")
 
-    # --------- save processed (copy AVI) ----------
     def save_as(self):
         if not self.proc_path or not os.path.isfile(self.proc_path):
-            QtWidgets.QMessageBox.information(self, "Nothing to save", "Please run Transform first.")
-            return
+            QtWidgets.QMessageBox.information(self, "Nothing to save", "Please run Transform first."); return
         dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save As", os.path.basename(self.proc_path), "AVI files (*.avi);;All files (*)")
         if not dst: return
-        try:
-            shutil.copyfile(self.proc_path, dst)
-            self.statusBar().showMessage(f"Saved: {dst}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+        try: shutil.copyfile(self.proc_path, dst); self.statusBar().showMessage(f"Saved: {dst}")
+        except Exception as e: QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
 
-    # --------- export MP4 (H.264/MP4V fallback) ----------
     def export_mp4(self):
         if not self.proc_path or not os.path.isfile(self.proc_path):
-            QtWidgets.QMessageBox.information(self, "Nothing to export", "Please run Transform first.")
-            return
+            QtWidgets.QMessageBox.information(self, "Nothing to export", "Please run Transform first."); return
 
         default_name = os.path.splitext(os.path.basename(self.proc_path))[0] + ".mp4"
         dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export MP4 (H.264/MP4)", default_name, "MP4 files (*.mp4)")
-        if not dst:
-            return
+        if not dst: return
 
         cap = cv2.VideoCapture(self.proc_path)
         if not cap.isOpened():
-            QtWidgets.QMessageBox.critical(self, "Error", "Failed to open processed video.")
-            return
+            QtWidgets.QMessageBox.critical(self, "Error", "Failed to open processed video."); return
 
         W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(self.spin_fps.value())
@@ -338,33 +338,27 @@ class MainWindow(QtWidgets.QMainWindow):
         for code in ("avc1", "H264", "mp4v"):
             writer = try_writer(code)
             if writer is not None:
-                chosen = code
-                break
+                chosen = code; break
 
         if writer is None:
             QtWidgets.QMessageBox.critical(self, "Export failed", "No suitable MP4 encoder found (avc1/H264/mp4v).")
-            cap.release()
-            return
+            cap.release(); return
 
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         prog = QtWidgets.QProgressDialog(f"Exporting MP4 ({chosen})…", "Cancel", 0, total if total>0 else 0, self)
-        prog.setWindowModality(QtCore.Qt.WindowModal)
-        prog.setMinimumDuration(0)
+        prog.setWindowModality(QtCore.Qt.WindowModal); prog.setMinimumDuration(0)
 
         idx = 0
         ok, frame = cap.read()
         while ok:
-            writer.write(frame)
-            idx += 1
+            writer.write(frame); idx += 1
             if total > 0 and idx % 5 == 0:
                 prog.setValue(idx)
-                if prog.wasCanceled():
-                    break
+                if prog.wasCanceled(): break
             ok, frame = cap.read()
 
         prog.setValue(total if total>0 else idx)
         writer.release(); cap.release()
-
         if prog.wasCanceled():
             try: os.remove(dst)
             except: pass
@@ -372,69 +366,32 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.statusBar().showMessage(f"Exported: {dst}")
 
-    # --------- playback controls ----------
     def toggle_play(self, playing: bool):
         if not self.play_cap:
             QtWidgets.QMessageBox.information(self, "No processed video", "Run Transform first.")
-            self.btn_play.setChecked(False)
-            return
+            self.btn_play.setChecked(False); return
         if playing:
             fps = float(self.spin_fps.value())
-            speed = max(1, int(self.slider_speed.value())) / 100.0  # 1%..100%
+            speed = max(1, int(self.slider_speed.value())) / 100.0
             interval_ms = max(1, int(1000 / max(fps * speed, 0.01)))
-            self.timer.start(interval_ms)
-            self.btn_play.setText("Pause")
+            self.timer.start(interval_ms); self.btn_play.setText("Pause")
         else:
-            self.timer.stop()
-            self.btn_play.setText("Play")
+            self.timer.stop(); self.btn_play.setText("Play")
 
     def stop_playback(self):
-        self.timer.stop()
-        self.btn_play.setChecked(False)
-        self.btn_play.setText("Play")
+        self.timer.stop(); self.btn_play.setChecked(False); self.btn_play.setText("Play")
         if self.play_cap:
             self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = self.play_cap.read()
-            if ok:
-                self.play_frame_idx = 1
-                self.show_frame(frame)
-            else:
-                self.play_frame_idx = 0
+            if ok: self.play_frame_idx = 1; self.show_frame(frame)
+            else: self.play_frame_idx = 0
             self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            try:
-                self.slider_timeline.blockSignals(True)
-                self.slider_timeline.setValue(0)
-            finally:
-                self.slider_timeline.blockSignals(False)
+            try: self.slider_timeline.blockSignals(True); self.slider_timeline.setValue(0)
+            finally: self.slider_timeline.blockSignals(False)
             self.update_time_label()
 
-    def next_frame_play(self):
-        if not self.play_cap: return
-        ok, frame = self.play_cap.read()
-        if not ok:
-            if self.chk_loop.isChecked():
-                self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self.play_frame_idx = 0
-                return
-            else:
-                self.btn_play.setChecked(False)
-                return
-
-        self.play_frame_idx += 1
-        self.show_frame(frame)
-        try:
-            self.slider_timeline.blockSignals(True)
-            self.slider_timeline.setValue(self.play_frame_idx - 1)
-        finally:
-            self.slider_timeline.blockSignals(False)
-        self.update_time_label()
-
-    # --------- ROI & UI helpers ----------
     def on_roi_changed(self, rect: QtCore.QRect):
-        if rect is None:
-            self.roi = None
-        else:
-            self.roi = (rect.x(), rect.y(), rect.width(), rect.height())
+        self.roi = None if rect is None else (rect.x(), rect.y(), rect.width(), rect.height())
 
     def update_time_label(self):
         fps = float(self.spin_fps.value())
