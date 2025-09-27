@@ -67,10 +67,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_high = QtWidgets.QDoubleSpinBox(); self.spin_high.setRange(0.05,300); self.spin_high.setValue(8.0); self.spin_high.setSuffix(" Hz")
         self.spin_levels = QtWidgets.QSpinBox(); self.spin_levels.setRange(1,5); self.spin_levels.setValue(3)
 
-        # Amplification = M (1 … 100×), brez deljenja
+        # Amplification slider: 1 … 100 (label prikazuje ×1 … ×100)
         self.slider_amp = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider_amp.setRange(1, 100)        # neposreden faktor
-        self.slider_amp.setValue(50)            # npr. 50×
+        self.slider_amp.setRange(1, 100)
+        self.slider_amp.setValue(50)
         self.lbl_amp = QtWidgets.QLabel(f"{self.slider_amp.value()}×")
         amp_row = QtWidgets.QHBoxLayout(); amp_row.addWidget(self.slider_amp); amp_row.addWidget(self.lbl_amp)
 
@@ -208,7 +208,9 @@ class MainWindow(QtWidgets.QMainWindow):
         high = min(high, fps/2 - 0.01)
         if high <= low: high = low + 0.01
         levels = int(self.spin_levels.value())
-        alpha = float(self.slider_amp.value())     # M = 1 … 100
+
+        # *** ključno: slider 1–100 → efektivno M = 10–1000
+        alpha = float(self.slider_amp.value()) * 10.0
 
         base, _ = os.path.splitext(self.src_path)
         out_path = base + "_magnified.avi"   # MJPG for accurate seeking
