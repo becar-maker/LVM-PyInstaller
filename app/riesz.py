@@ -1,256 +1,441 @@
-import numpy as np
-import cv2
-import math
+import sys, os, shutil, cv2, numpy as np
+from PySide6 import QtCore, QtGui, QtWidgets
+from roi_label import VideoLabel
+from riesz import RieszMotionMagnifier
 
-_EPS = 1e-8
+APP_TITLE = "Live Video Magnification (Riesz Motion)"
 
-# ==============================
-#   Laplacian piramida (Burt–Adelson, symmetric robovi)
-# ==============================
-# 1D binomsko jedro [1 4 6 4 1]/16
-_G1D = np.array([1, 4, 6, 4, 1], np.float32) / 16.0
-_BORDER = cv2.BORDER_REFLECT_101  # "symmetric" kot v MATLAB-u
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1200, 780)
 
-def _sep_gauss5(img: np.ndarray) -> np.ndarray:
-    """Separable 5-tap filter z 'symmetric' robovi."""
-    return cv2.sepFilter2D(img, ddepth=-1, kernelX=_G1D, kernelY=_G1D, borderType=_BORDER)
+        # === CENTRALNI LAYOUT: VIDEO ZGORAJ, ORODJA SPODAJ ===
+        central = QtWidgets.QWidget()
+        vbox = QtWidgets.QVBoxLayout(central)
+        vbox.setContentsMargins(10, 10, 10, 10)
+        vbox.setSpacing(10)
 
-def _reduce(img: np.ndarray) -> np.ndarray:
-    """G_{i+1} = downsample2( gaussian5 * G_i )"""
-    low = _sep_gauss5(img)
-    return low[::2, ::2].copy()
+        # --- video view ---
+        self.label = VideoLabel()
+        self.label.setMinimumSize(720, 405)
+        self.label.roiChanged.connect(self.on_roi_changed)
+        vbox.addWidget(self.label, stretch=1)
 
-def _expand(img: np.ndarray, dst_hw) -> np.ndarray:
-    """
-    Expand G_{i+1} nazaj na velikost G_i:
-      - vstavimo ničle med piksle
-      - filtriramo z 4x gauss5 (klasično expand za ohranitev energije)
-    """
-    H, W = dst_hw
-    up = np.zeros((H, W), np.float32)
-    up[::2, ::2] = img
-    # 4x faktor po Burt–Adelsonu
-    k = _G1D * 4.0
-    up = cv2.sepFilter2D(up, ddepth=-1, kernelX=k, kernelY=k, borderType=_BORDER)
-    return up
+        # --- Playback vrstica (Open/Transform/Play/Stop/Save/Export MP4) ---
+        row1 = QtWidgets.QHBoxLayout()
+        self.btn_open = QtWidgets.QPushButton("Open")
+        self.btn_transform = QtWidgets.QPushButton("Transform (Riesz)")
+        self.btn_play = QtWidgets.QPushButton("Play"); self.btn_play.setCheckable(True)
+        self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.btn_save = QtWidgets.QPushButton("Save As…")
+        self.btn_export = QtWidgets.QPushButton("Export MP4…")
+        for b in (self.btn_open, self.btn_transform, self.btn_play, self.btn_stop, self.btn_save, self.btn_export):
+            b.setMinimumWidth(110)
+        row1.addWidget(self.btn_open)
+        row1.addWidget(self.btn_transform)
+        row1.addStretch(1)
+        row1.addWidget(self.btn_play)
+        row1.addWidget(self.btn_stop)
+        row1.addWidget(self.btn_save)
+        row1.addWidget(self.btn_export)
+        vbox.addLayout(row1)
 
-def _build_laplacian_pyramid(img: np.ndarray, levels: int):
-    """
-    Vrne (liste Laplace bandov [lvl0..lvlL-1], residual na dnu).
-    lvl0 je najvišja ločljivost (najfinejši band).
-    """
-    g = [img]
-    for _ in range(levels):
-        g.append(_reduce(g[-1]))
-    lap = []
-    for i in range(levels):
-        up = _expand(g[i+1], g[i].shape[:2])
-        # poravnava dimezije (če pride do +-1 zaradi deljenja)
-        if up.shape != g[i].shape:
-            up = cv2.resize(up, (g[i].shape[1], g[i].shape[0]), interpolation=cv2.INTER_LINEAR)
-        lap.append(g[i] - up)
-    return lap, g[-1]
+        # --- Timeline + Slow speed ---
+        row2 = QtWidgets.QHBoxLayout()
+        self.slider_timeline = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.slider_timeline.setRange(0, 0)
+        self.lbl_time = QtWidgets.QLabel("00:00 / 00:00")
+        row2.addWidget(QtWidgets.QLabel("Timeline:"))
+        row2.addWidget(self.slider_timeline, stretch=1)
+        row2.addWidget(self.lbl_time)
+        row2.addSpacing(20)
+        self.slider_speed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_speed.setRange(1, 100)      # 1% … 100%
+        self.slider_speed.setValue(100)         # default 100%
+        self.lbl_speed = QtWidgets.QLabel("Speed: 100%")
+        row2.addWidget(QtWidgets.QLabel("Slow speed:"))
+        row2.addWidget(self.slider_speed)
+        row2.addWidget(self.lbl_speed)
+        vbox.addLayout(row2)
 
-def _reconstruct_from_laplacian(lap, residual):
-    img = residual
-    for i in reversed(range(len(lap))):
-        up = _expand(img, lap[i].shape[:2])
-        if up.shape != lap[i].shape:
-            up = cv2.resize(up, (lap[i].shape[1], lap[i].shape[0]), interpolation=cv2.INTER_LINEAR)
-        img = up + lap[i]
-    return img
+        # --- Parametri (FPS, pas, levels, amplification, loop) ---
+        grid = QtWidgets.QGridLayout()
+        r = 0
+        self.spin_fps  = QtWidgets.QDoubleSpinBox(); self.spin_fps.setRange(1,1000); self.spin_fps.setValue(30); self.spin_fps.setSuffix(" fps")
+        self.spin_low  = QtWidgets.QDoubleSpinBox(); self.spin_low.setRange(0.01,200); self.spin_low.setValue(2.0); self.spin_low.setSuffix(" Hz")
+        self.spin_high = QtWidgets.QDoubleSpinBox(); self.spin_high.setRange(0.05,300); self.spin_high.setValue(8.0); self.spin_high.setSuffix(" Hz")
+        self.spin_levels = QtWidgets.QSpinBox(); self.spin_levels.setRange(1,5); self.spin_levels.setValue(3)
 
-# ==============================
-#   Riesz 3×3 jedra (kot v MATLAB)
-# ==============================
-KX = np.array([[0, 0, 0],
-               [0.5, 0, -0.5],
-               [0, 0, 0]], np.float32)
-KY = np.array([[0, 0.5, 0],
-               [0, 0, 0],
-               [0, -0.5, 0]], np.float32)
+        # Amplification slider: 1 … 100 (label prikazuje ×1 … ×100)
+        self.slider_amp = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_amp.setRange(1, 100)
+        self.slider_amp.setValue(50)
+        self.lbl_amp = QtWidgets.QLabel(f"{self.slider_amp.value()}×")
+        amp_row = QtWidgets.QHBoxLayout(); amp_row.addWidget(self.slider_amp); amp_row.addWidget(self.lbl_amp)
 
-def _riesz_components(band: np.ndarray):
-    Rx = cv2.filter2D(band, cv2.CV_32F, KX, borderType=_BORDER)
-    Ry = cv2.filter2D(band, cv2.CV_32F, KY, borderType=_BORDER)
-    return Rx, Ry
+        self.chk_loop = QtWidgets.QCheckBox("Loop at end"); self.chk_loop.setChecked(True)
 
-# ==============================
-#   IIR band-pass (difference-of-IIR, kot v .m)
-# ==============================
-class _IIRBandpass:
-    """
-    Dva enopolna LP filtra pri fH in fL → band = LP(fH) - LP(fL).
-    Inicializacija na x (kot v praksi v MATLAB skriptih) za hiter "warm-up".
-    """
-    def __init__(self, low_hz: float, high_hz: float, fps: float, shape):
-        assert high_hz > low_hz > 0 and fps > 0
-        self.aH = float(math.exp(-2.0 * math.pi * high_hz / fps))
-        self.aL = float(math.exp(-2.0 * math.pi * low_hz  / fps))
-        self.yH = np.zeros(shape, np.float32)
-        self.yL = np.zeros(shape, np.float32)
-        self.initialized = False
+        grid.addWidget(QtWidgets.QLabel("FPS (override):"), r, 0); grid.addWidget(self.spin_fps, r, 1); r+=1
+        grid.addWidget(QtWidgets.QLabel("Low cut (Hz):"),   r, 0); grid.addWidget(self.spin_low, r, 1); r+=1
+        grid.addWidget(QtWidgets.QLabel("High cut (Hz):"),  r, 0); grid.addWidget(self.spin_high, r, 1); r+=1
+        grid.addWidget(QtWidgets.QLabel("Levels:"),         r, 0); grid.addWidget(self.spin_levels, r, 1); r+=1
+        grid.addWidget(QtWidgets.QLabel("Amplification:"),  r, 0); grid.addLayout(amp_row, r, 1); r+=1
+        grid.addWidget(self.chk_loop, r, 0, 1, 2); r+=1
 
-    def update(self, x: np.ndarray) -> np.ndarray:
-        if not self.initialized:
-            self.yH[...] = x
-            self.yL[...] = x
-            self.initialized = True
-        self.yH = (1.0 - self.aH) * x + self.aH * self.yH
-        self.yL = (1.0 - self.aL) * x + self.aL * self.yL
-        return self.yH - self.yL
+        grid_box = QtWidgets.QGroupBox("Parameters")
+        grid_box.setLayout(grid)
+        vbox.addWidget(grid_box)
 
-# ==============================
-#   AmplitudeWeightedBlur + soft mask
-# ==============================
-def _amp_weighted_blur(signal: np.ndarray, amplitude: np.ndarray, sigma: float) -> np.ndarray:
-    if sigma <= 0.0:
-        return signal
-    ksz = int(4 * sigma + 1) | 1
-    w = amplitude + 1e-8
-    num = cv2.GaussianBlur(signal * w, (ksz, ksz), sigma, borderType=_BORDER)
-    den = cv2.GaussianBlur(w,             (ksz, ksz), sigma, borderType=_BORDER)
-    return num / (den + 1e-8)
+        self.setCentralWidget(central)
 
-# ==============================
-#   Glavna klasa
-# ==============================
-class RieszMotionMagnifier:
-    """
-    MATLAB-like Riesz motion magnification:
-      - Laplacian piramida (Burt–Adelson; symmetric robovi)
-      - Riesz 3×3 jedra → q = (a, Rx, Ry)
-      - kvaternionična fazna razlika: q_cur * conj(q_prev) → (r, vx, vy)
-      - časovna kumulacija (unwrap) projekcij (cos, sin)
-      - IIR band-pass (difference-of-IIR)
-      - soft maska m = A/(A+τ) + AmplitudeWeightedBlur(σ)
-      - phase-shift: q_out = exp(n*θ) * q_cur → vzamemo real(q_out) kot band_out
-    `alpha` = M (Amplification: 1..100) — ciljni faktor premika band-pass komponent.
-    """
-    def __init__(self, levels: int, low_hz: float, high_hz: float, fps: float, shape_hw):
-        self.levels = int(max(1, min(5, levels)))
-        self.low = float(low_hz)
-        self.high = float(high_hz)
-        self.fps = float(fps)
+        # --- Status bar ---
+        self.setStatusBar(QtWidgets.QStatusBar(self))
 
-        # Parametri stabilnosti (po vzoru MATLAB utilityjev)
-        self.blur_sigma = 1.0  # Gauss σ za AW blur (0.0 za izklop)
-        self.tau_mask   = 0.2  # τ v m = A/(A+τ); večji τ → manj ojačanja v šibkih območjih
+        # === SIGNALI ===
+        self.btn_open.clicked.connect(self.open_video)
+        self.btn_transform.clicked.connect(self.transform_video)
+        self.btn_play.toggled.connect(self.toggle_play)
+        self.btn_stop.clicked.connect(self.stop_playback)
+        self.btn_save.clicked.connect(self.save_as)
+        self.btn_export.clicked.connect(self.export_mp4)
 
-        # Stanje per-level
-        self.prev_a = None
-        self.prev_rx = None
-        self.prev_ry = None
-        self.cum_cos = None
-        self.cum_sin = None
-        self.bp_cos = None
-        self.bp_sin = None
-        self._init_state(shape_hw)
+        self.slider_amp.valueChanged.connect(lambda v: self.lbl_amp.setText(f"{v}×"))
+        self.slider_speed.valueChanged.connect(self.on_speed_changed)
 
-    def _init_state(self, shape_hw):
-        zeros = np.zeros(shape_hw, np.float32)
-        lap, _ = _build_laplacian_pyramid(zeros, self.levels)
-        shp = [l.shape for l in lap]
+        for w in (self.spin_fps, self.spin_low, self.spin_high, self.spin_levels):
+            w.valueChanged.connect(self.invalidate_processed)
 
-        self.prev_a  = [ None for _ in shp ]
-        self.prev_rx = [ None for _ in shp ]
-        self.prev_ry = [ None for _ in shp ]
+        self.slider_timeline.sliderPressed.connect(self.pause_for_seek)
+        self.slider_timeline.sliderReleased.connect(self.seek_to_slider)
 
-        self.cum_cos = [ np.zeros(s, np.float32) for s in shp ]
-        self.cum_sin = [ np.zeros(s, np.float32) for s in shp ]
+        # === STANJE ===
+        self.src_path = None
+        self.src_cap = None
+        self.src_fps = 30.0
+        self.src_frame_count = 0
 
-        self.bp_cos  = [ _IIRBandpass(self.low, self.high, self.fps, s) for s in shp ]
-        self.bp_sin  = [ _IIRBandpass(self.low, self.high, self.fps, s) for s in shp ]
+        self.proc_path = None
+        self.play_cap = None
+        self.play_frame_count = 0
+        self.play_frame_idx = 0
 
-    def reinit(self, levels: int, low_hz: float, high_hz: float, fps: float, shape_hw):
-        self.levels = int(max(1, min(5, levels)))
-        self.low = float(low_hz)
-        self.high = float(high_hz)
-        self.fps = float(fps)
-        self._init_state(shape_hw)
+        self.timer = QtCore.QTimer(self)
+        self.timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.timer.timeout.connect(self.next_frame_play)
 
-    def magnify(self, gray01: np.ndarray, alpha: float) -> np.ndarray:
-        """
-        Vhod: gray01 (float32, 0..1) → Izhod: magnified gray (float32, 0..1)
-        """
-        alpha = float(np.clip(alpha, 1.0, 100.0))  # varnostna omejitev
-        gain = alpha - 1.0
+        self.roi = None  # (x,y,w,h)
 
-        img = gray01.astype(np.float32)
+    # --------- helpers ----------
+    def on_speed_changed(self, v: int):
+        self.lbl_speed.setText(f"Speed: {v}%")
+        if self.btn_play.isChecked():
+            fps = float(self.spin_fps.value())
+            speed = max(1, int(self.slider_speed.value())) / 100.0
+            interval_ms = max(1, int(1000 / max(fps * speed, 0.01)))
+            self.timer.start(interval_ms)
 
-        # 1) Laplacian piramida
-        lap, residual = _build_laplacian_pyramid(img, self.levels)
+    def invalidate_processed(self):
+        self.proc_path = None
+        if self.play_cap: self.play_cap.release(); self.play_cap = None
+        self.slider_timeline.setRange(0, 0)
+        self.lbl_time.setText("00:00 / 00:00")
+        self.statusBar().showMessage("Parameters changed — please Transform again.")
 
-        out_lap = []
-        for i, band in enumerate(lap):
-            a = band.astype(np.float32)  # even komponenta
-            Rx, Ry = _riesz_components(a)  # odd komponenti
-            A = np.sqrt(a*a + Rx*Rx + Ry*Ry) + _EPS  # amplituda koeficienta (za masko/glajenje)
+    def format_time(self, frames, fps):
+        if fps <= 0: return "00:00"
+        total_sec = int(frames / fps)
+        m, s = divmod(total_sec, 60)
+        return f"{m:02d}:{s:02d}"
 
-            pa  = self.prev_a[i]
-            prx = self.prev_rx[i]
-            pry = self.prev_ry[i]
+    def pause_for_seek(self):
+        if self.btn_play.isChecked():
+            self.btn_play.setChecked(False)
 
-            if pa is None:
-                # init: zapomni si trenutne koeficiente; brez faznega zamika
-                self.prev_a[i]  = a.copy()
-                self.prev_rx[i] = Rx.copy()
-                self.prev_ry[i] = Ry.copy()
-                out_lap.append(a)
-                continue
+    def seek_to_slider(self):
+        if not self.play_cap: return
+        idx = int(self.slider_timeline.value())
+        self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = self.play_cap.read()
+        if ok:
+            self.play_frame_idx = idx + 1
+            self.show_frame(frame)
+            self.update_time_label()
+        else:
+            self.update_time_label()
 
-            # 2) kvaternionična fazna razlika med zaporednima koeficientoma
-            # q_cur * conj(q_prev) → (r, vx, vy); (z-komponenta tukaj ni uporabljena)
-            r  = a*pa + Rx*prx + Ry*pry
-            vx = pa*Rx - a*prx
-            vy = pa*Ry - a*pry
+    # --------- open / preview ----------
+    def open_video(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open video", "", "Video files (*.mp4 *.avi *.mkv *.mov *.mpg *.mpeg);;All files (*)")
+        if not path: return
 
-            norm = np.sqrt(r*r + vx*vx + vy*vy) + _EPS
-            # fazni kot [0..π]
-            phase = np.clip(r / norm, -1.0, 1.0)
-            phase = np.arccos(phase)
+        if self.src_cap: self.src_cap.release()
+        self.src_path = path
+        self.src_cap = cv2.VideoCapture(self.src_path)
+        if not self.src_cap.isOpened():
+            QtWidgets.QMessageBox.critical(self, "Error", "Failed to open video."); return
 
-            vnorm = np.sqrt(vx*vx + vy*vy) + _EPS
-            cos_t = vx / vnorm
-            sin_t = vy / vnorm
+        fps = self.src_cap.get(cv2.CAP_PROP_FPS) or 0
+        if fps > 0:
+            try: self.spin_fps.setValue(float(fps))
+            except: pass
+            self.src_fps = float(self.spin_fps.value())
+        else:
+            self.src_fps = float(self.spin_fps.value())
 
-            # 3) časovna kumulacija (unwrap) projekcij
-            self.cum_cos[i] += phase * cos_t
-            self.cum_sin[i] += phase * sin_t
+        self.src_frame_count = int(self.src_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-            # 4) IIR band-pass na kumuliranih komponentah (brez normalizacij)
-            fcos = self.bp_cos[i].update(self.cum_cos[i])
-            fsin = self.bp_sin[i].update(self.cum_sin[i])
+        ok, first = self.src_cap.read()
+        if ok: self.show_frame(first)
+        self.src_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-            # 5) soft maska + AW blur
-            m = A / (A + self.tau_mask)
-            fcos *= m
-            fsin *= m
+        self.roi = None; self.label.clear_roi()
+        self.invalidate_processed()
+        self.statusBar().showMessage(f"Opened: {os.path.basename(self.src_path)} ({self.src_fps:.2f} fps, {self.src_frame_count} frames)")
 
-            if self.blur_sigma > 0.0:
-                fcos = _amp_weighted_blur(fcos, A, self.blur_sigma)
-                fsin = _amp_weighted_blur(fsin, A, self.blur_sigma)
+    # --------- transform (offline) ----------
+    def transform_video(self):
+        if not self.src_cap or not self.src_path:
+            QtWidgets.QMessageBox.warning(self, "No video", "Open a video first."); return
 
-            # 6) ojačanje (M-1)
-            fcos *= gain
-            fsin *= gain
+        x, y, w, h = (0, 0, int(self.src_cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.src_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))) \
+                     if not self.roi else self.roi
 
-            # 7) phase-shift: q_out = exp(n*θ) * q_cur
-            mag = np.sqrt(fcos*fcos + fsin*fsin) + _EPS
-            exp_r  = np.cos(mag)
-            s_over = np.sin(mag) / mag
-            ex = fcos * s_over
-            ey = fsin * s_over
+        fps = float(self.spin_fps.value())
+        low = float(self.spin_low.value())
+        high = float(self.spin_high.value())
+        high = min(high, fps/2 - 0.01)
+        if high <= low: high = low + 0.01
+        levels = int(self.spin_levels.value())
 
-            # real(q_out) = exp_r * a - ex * Rx - ey * Ry
-            a_out = exp_r * a - ex * Rx - ey * Ry
-            out_lap.append(a_out)
+        # *** ključno: slider 1–100 → efektivno M = 10–1000
+        alpha = float(self.slider_amp.value()) * 10.0
 
-            # 8) posodobitev prejšnjih koeficientov
-            self.prev_a[i][...]  = a
-            self.prev_rx[i][...] = Rx
-            self.prev_ry[i][...] = Ry
+        base, _ = os.path.splitext(self.src_path)
+        out_path = base + "_magnified.avi"   # MJPG for accurate seeking
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
 
-        # 9) rekonstrukcija slike
-        out = _reconstruct_from_laplacian(out_lap, residual)
-        return np.clip(out, 0.0, 1.0).astype(np.float32)
+        cap = cv2.VideoCapture(self.src_path)
+        if not cap.isOpened():
+            QtWidgets.QMessageBox.critical(self, "Error", "Failed to reopen source."); return
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
+        if not writer.isOpened():
+            QtWidgets.QMessageBox.critical(self, "Error", "Cannot open VideoWriter."); return
+
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        prog = QtWidgets.QProgressDialog("Transforming…", "Cancel", 0, total if total>0 else 0, self)
+        prog.setWindowModality(QtCore.Qt.WindowModal)
+        prog.setMinimumDuration(0)
+
+        magnifier = None
+        idx = 0
+        ok, frame = cap.read()
+        while ok:
+            roi_view = frame[y:y+h, x:x+w]
+            if roi_view.ndim == 2:
+                gray = roi_view.astype(np.float32) / 255.0
+            else:
+                gray = cv2.cvtColor(roi_view, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+            if magnifier is None:
+                magnifier = RieszMotionMagnifier(levels, low, high, fps, shape_hw=gray.shape)
+
+            out = magnifier.magnify(gray, alpha)
+            out_u8 = (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+            out_bgr = cv2.cvtColor(out_u8, cv2.COLOR_GRAY2BGR)
+
+            disp = frame.copy()
+            disp[y:y+h, x:x+w] = out_bgr
+            writer.write(disp)
+
+            idx += 1
+            if total > 0 and idx % 5 == 0:
+                prog.setValue(idx)
+                if prog.wasCanceled():
+                    break
+
+            ok, frame = cap.read()
+
+        prog.setValue(total if total>0 else idx)
+        cap.release(); writer.release()
+
+        if prog.wasCanceled():
+            try: os.remove(out_path)
+            except: pass
+            self.statusBar().showMessage("Transform canceled.")
+            return
+
+        if self.play_cap: self.play_cap.release()
+        self.proc_path = out_path
+        self.play_cap = cv2.VideoCapture(self.proc_path)
+        self.play_frame_count = int(self.play_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.play_frame_idx = 0
+
+        self.slider_timeline.setRange(0, max(0, self.play_frame_count - 1))
+        ok, first_proc = self.play_cap.read()
+        if ok:
+            self.play_frame_idx = 1
+            self.show_frame(first_proc)
+        self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.update_time_label()
+        self.statusBar().showMessage(f"Transform done: {os.path.basename(self.proc_path)}")
+
+    # --------- save processed (copy AVI) ----------
+    def save_as(self):
+        if not self.proc_path or not os.path.isfile(self.proc_path):
+            QtWidgets.QMessageBox.information(self, "Nothing to save", "Please run Transform first.")
+            return
+        dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save As", os.path.basename(self.proc_path), "AVI files (*.avi);;All files (*)")
+        if not dst: return
+        try:
+            shutil.copyfile(self.proc_path, dst)
+            self.statusBar().showMessage(f"Saved: {dst}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+
+    # --------- export MP4 (H.264/MP4V fallback) ----------
+    def export_mp4(self):
+        if not self.proc_path or not os.path.isfile(self.proc_path):
+            QtWidgets.QMessageBox.information(self, "Nothing to export", "Please run Transform first.")
+            return
+
+        default_name = os.path.splitext(os.path.basename(self.proc_path))[0] + ".mp4"
+        dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export MP4 (H.264/MP4)", default_name, "MP4 files (*.mp4)")
+        if not dst:
+            return
+
+        cap = cv2.VideoCapture(self.proc_path)
+        if not cap.isOpened():
+            QtWidgets.QMessageBox.critical(self, "Error", "Failed to open processed video.")
+            return
+
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = float(self.spin_fps.value())
+
+        def try_writer(code):
+            fourcc = cv2.VideoWriter_fourcc(*code)
+            writer = cv2.VideoWriter(dst, fourcc, fps, (W, H))
+            return writer if writer.isOpened() else None
+
+        writer = None
+        for code in ("avc1", "H264", "mp4v"):
+            writer = try_writer(code)
+            if writer is not None:
+                chosen = code
+                break
+
+        if writer is None:
+            QtWidgets.QMessageBox.critical(self, "Export failed", "No suitable MP4 encoder found (avc1/H264/mp4v).")
+            cap.release()
+            return
+
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        prog = QtWidgets.QProgressDialog(f"Exporting MP4 ({chosen})…", "Cancel", 0, total if total>0 else 0, self)
+        prog.setWindowModality(QtCore.Qt.WindowModal)
+        prog.setMinimumDuration(0)
+
+        idx = 0
+        ok, frame = cap.read()
+        while ok:
+            writer.write(frame)
+            idx += 1
+            if total > 0 and idx % 5 == 0:
+                prog.setValue(idx)
+                if prog.wasCanceled():
+                    break
+            ok, frame = cap.read()
+
+        prog.setValue(total if total>0 else idx)
+        writer.release(); cap.release()
+
+        if prog.wasCanceled():
+            try: os.remove(dst)
+            except: pass
+            self.statusBar().showMessage("Export canceled.")
+        else:
+            self.statusBar().showMessage(f"Exported: {dst}")
+
+    # --------- playback controls ----------
+    def toggle_play(self, playing: bool):
+        if not self.play_cap:
+            QtWidgets.QMessageBox.information(self, "No processed video", "Run Transform first.")
+            self.btn_play.setChecked(False)
+            return
+        if playing:
+            fps = float(self.spin_fps.value())
+            speed = max(1, int(self.slider_speed.value())) / 100.0  # 1%..100%
+            interval_ms = max(1, int(1000 / max(fps * speed, 0.01)))
+            self.timer.start(interval_ms)
+            self.btn_play.setText("Pause")
+        else:
+            self.timer.stop()
+            self.btn_play.setText("Play")
+
+    def stop_playback(self):
+        self.timer.stop()
+        self.btn_play.setChecked(False)
+        self.btn_play.setText("Play")
+        if self.play_cap:
+            self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.play_cap.read()
+            if ok:
+                self.play_frame_idx = 1
+                self.show_frame(frame)
+            else:
+                self.play_frame_idx = 0
+            self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            try:
+                self.slider_timeline.blockSignals(True)
+                self.slider_timeline.setValue(0)
+            finally:
+                self.slider_timeline.blockSignals(False)
+            self.update_time_label()
+
+    def next_frame_play(self):
+        if not self.play_cap: return
+        ok, frame = self.play_cap.read()
+        if not ok:
+            if self.chk_loop.isChecked():
+                self.play_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self.play_frame_idx = 0
+                return
+            else:
+                self.btn_play.setChecked(False)
+                return
+
+        self.play_frame_idx += 1
+        self.show_frame(frame)
+        try:
+            self.slider_timeline.blockSignals(True)
+            self.slider_timeline.setValue(self.play_frame_idx - 1)
+        finally:
+            self.slider_timeline.blockSignals(False)
+        self.update_time_label()
+
+    # --------- ROI & UI helpers ----------
+    def on_roi_changed(self, rect: QtCore.QRect):
+        if rect is None:
+            self.roi = None
+        else:
+            self.roi = (rect.x(), rect.y(), rect.width(), rect.height())
+
+    def update_time_label(self):
+        fps = float(self.spin_fps.value())
+        cur = max(0, self.play_frame_idx - 1)
+        t_cur = self.format_time(cur, fps)
+        t_tot = self.format_time(self.play_frame_count, fps) if self.play_frame_count > 0 else "00:00"
+        self.lbl_time.setText(f"{t_cur} / {t_tot}")
+
+    def show_frame(self, bgr):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QtGui.QImage(rgb.data, w, h, ch*w, QtGui.QImage.Format.Format_RGB888)
+        self.label.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
+            self.label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow(); win.show()
+    sys.exit(app.exec())
