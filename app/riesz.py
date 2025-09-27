@@ -46,19 +46,11 @@ def _riesz_components(band: np.ndarray):
 
 # ---------- normaliziran IIR band-pass ----------
 def _lp_mag(a: float, omega: float) -> float:
-    """
-    Magnituda enopolnega LP filtra y = (1-a)x + a y[-1] pri kotni frekvenci omega (rad/sample).
-    |H_lp(e^jω)| = (1-a) / sqrt(1 + a^2 - 2 a cos ω)
-    """
     num = 1.0 - a
     den = math.sqrt(1.0 + a*a - 2.0*a*math.cos(omega))
     return num / max(den, 1e-12)
 
 class _NormIIRBandpass:
-    """
-    Band-pass kot razlika dveh enopolnih LP (pri fH in fL), z **normalizacijo gaina**
-    na središčni frekvenci fC = sqrt(fL * fH).
-    """
     def __init__(self, low_hz: float, high_hz: float, fps: float, shape):
         assert low_hz > 0 and high_hz > low_hz and fps > 0
         self.aH = float(math.exp(-2 * math.pi * high_hz / fps))
@@ -67,7 +59,6 @@ class _NormIIRBandpass:
         self.yL = np.zeros(shape, np.float32)
         self.initialized = False
 
-        # center frequency & normalizacija magnitude pri fC
         fC = math.sqrt(low_hz * high_hz)
         omega_c = 2.0 * math.pi * (fC / fps)
         gH = _lp_mag(self.aH, omega_c)
@@ -98,7 +89,7 @@ def _amp_weighted_blur(signal: np.ndarray, amplitude: np.ndarray, sigma: float) 
 class RieszMotionMagnifier:
     """
     MATLAB-like kvaternionična Riesz magnifikacija z **normaliziranim band-passom**.
-    `alpha` = M (Amplification: 10..1000, ker main.py pošlje slider*10).
+    `alpha` = M (Amplification: 1..100) — ciljni faktor premika band-pass komponente.
     """
     def __init__(self, levels: int, low_hz: float, high_hz: float, fps: float, shape_hw):
         self.levels = int(max(1, min(5, levels)))
@@ -145,8 +136,7 @@ class RieszMotionMagnifier:
         """
         Vhod: gray01 (float32, 0..1) → Izhod: magnified gray (float32, 0..1)
         """
-        # dopuščamo do 1000, ker main.py množi slider ×10
-        alpha = float(np.clip(alpha, 1.0, 1000.0))
+        alpha = float(np.clip(alpha, 1.0, 100.0))  # varnostna omejitev
 
         img = gray01.astype(np.float32)
 
